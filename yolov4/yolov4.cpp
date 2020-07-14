@@ -592,8 +592,9 @@ int main(int argc, char** argv) {
     // create a model using the API directly and serialize it to a stream
     char *trtModelStream{nullptr};
     size_t size{0};
+    std::string rtcmd = std::string(argv[1]);
 
-    if (argc == 2 && std::string(argv[1]) == "-s") {
+    if (argc == 2 && rtcmd == "-s") {
         IHostMemory* modelStream{nullptr};
         APIToModel(BATCH_SIZE, &modelStream);
         assert(modelStream != nullptr);
@@ -605,7 +606,7 @@ int main(int argc, char** argv) {
         p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
         modelStream->destroy();
         return 0;
-    } else if (argc == 3 && std::string(argv[1]) == "-d") {
+    } else if (argc == 3 && (rtcmd == "-d" || rtcmd == "-c")) {
         std::ifstream file("yolov4.engine", std::ios::binary);
         if (file.good()) {
             file.seekg(0, file.end);
@@ -616,80 +617,151 @@ int main(int argc, char** argv) {
             file.read(trtModelStream, size);
             file.close();
         }
+        // prepare input data ---------------------------
+        static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
+        static float prob[BATCH_SIZE * OUTPUT_SIZE];
+        std::vector<cv::Mat> imgs;
+        cv::Mat pr_img, bgr[3];
+
+        IRuntime* runtime = createInferRuntime(gLogger);
+        assert(runtime != nullptr);
+        ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size);
+        assert(engine != nullptr);
+        IExecutionContext* context = engine->createExecutionContext();
+        assert(context != nullptr);
+        delete[] trtModelStream;
+
+        if (rtcmd=="-d"){
+            std::vector<std::string> file_names;
+            if (read_files_in_dir(argv[2], file_names) < 0) {
+                std::cout << "read_files_in_dir failed." << std::endl;
+                return -1;
+            }
+
+            int fcount = 0;
+            for (int f = 0; f < (int)file_names.size(); f++) {
+                fcount++;
+                if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
+                auto start = std::chrono::system_clock::now();
+                for (int b = 0; b < fcount; b++) {
+                    cv::Mat img = cv::imread(std::string(argv[2]) + "/" + file_names[f - fcount + 1 + b]);
+                    imgs.push_back(img);
+                    preprocess_img(img).convertTo(pr_img, CV_32FC3, 1/255.0);
+                    cv::split(pr_img, bgr);
+                    memcpy(&data[b*3*INPUT_H*INPUT_W], bgr[2].data, pr_img.rows*pr_img.cols*sizeof(float));
+                    memcpy(&data[b*3*INPUT_H*INPUT_W+INPUT_H*INPUT_W], bgr[1].data, pr_img.rows*pr_img.cols*sizeof(float));
+                    memcpy(&data[b*3*INPUT_H*INPUT_W+2*INPUT_H*INPUT_W], bgr[0].data, pr_img.rows*pr_img.cols*sizeof(float));
+                }
+                auto end = std::chrono::system_clock::now();
+                std::cout << "preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+                
+                // Run inference
+                start = std::chrono::system_clock::now();
+                doInference(*context, data, prob, BATCH_SIZE);
+                end = std::chrono::system_clock::now();
+                std::cout << "inference: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+                
+                start = std::chrono::system_clock::now();
+                std::vector<std::vector<Yolo::Detection>> batch_res(fcount);
+                for (int b = 0; b < fcount; b++) {
+                    auto& res = batch_res[b];
+                    nms(res, &prob[b * OUTPUT_SIZE]);
+                }
+                for (int b = 0; b < fcount; b++) {
+                    auto& res = batch_res[b];
+                    cv::Mat& img = imgs[b];
+                    for (size_t j = 0; j < res.size(); j++) {
+                        cv::Rect r = get_rect(img, res[j].bbox);
+                        cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
+                        cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+                    }
+                    cv::imwrite("_" + file_names[f - fcount + 1 + b], img);
+                }
+                end = std::chrono::system_clock::now();
+                std::cout << "postprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+                
+                fcount = 0;
+                imgs.clear();
+            }
+
+        }
+        else{
+            int camID = (int)(argv[2][0]-'0');
+            cv::VideoCapture cam(camID);
+            if (!cam.isOpened()){
+                std::cout<< "Unable to open camera, device id: "<<camID<<std::endl;
+                return 0;
+            }
+            
+            cam.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+            cam.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            cam.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+
+            std::string win_name("YOLOv4 original");
+            cv::namedWindow(win_name);
+            cv::Mat frame;
+            while(true){
+                auto start = std::chrono::system_clock::now();
+                for(int b=0; b<BATCH_SIZE; b++){
+                    if(!cam.read(frame))
+                        continue;
+                    imgs.push_back(frame);
+                    preprocess_img(frame).convertTo(pr_img, CV_32FC3, 1/255.0);
+                    cv::split(pr_img, bgr);
+                    memcpy(&data[b*3*INPUT_H*INPUT_W], bgr[2].data, pr_img.rows*pr_img.cols*sizeof(float));
+                    memcpy(&data[b*3*INPUT_H*INPUT_W+INPUT_H*INPUT_W], bgr[1].data, pr_img.rows*pr_img.cols*sizeof(float));
+                    memcpy(&data[b*3*INPUT_H*INPUT_W+2*INPUT_H*INPUT_W], bgr[0].data, pr_img.rows*pr_img.cols*sizeof(float));
+                }
+                auto end = std::chrono::system_clock::now();
+                std::cout << "preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+
+                // Run inference
+                start = std::chrono::system_clock::now();
+                doInference(*context, data, prob, BATCH_SIZE);
+                end = std::chrono::system_clock::now();
+                std::cout << "inference: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+                
+                start = std::chrono::system_clock::now();
+                std::vector<std::vector<Yolo::Detection>> batch_res(BATCH_SIZE);
+                for (int b = 0; b < BATCH_SIZE; b++) {
+                    auto& res = batch_res[b];
+                    nms(res, &prob[b * OUTPUT_SIZE]);
+                }
+                for (int b = 0; b < BATCH_SIZE; b++) {
+                    std::cout<<"index(batch): "<<b<<"\n";
+                    auto& res = batch_res[b];
+                    cv::Mat& img = imgs[b];
+                    for (size_t j = 0; j < res.size(); j++) {
+                        cv::Rect r = get_rect(img, res[j].bbox);
+                        cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
+                        cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+                        std::cout<<"class id: "<<res[j].class_id<<"\tconfidence: "<<res[j].class_confidence<<std::endl;
+                    }
+                    
+                    cv::imshow(win_name, img); // img show
+                }
+                end = std::chrono::system_clock::now();
+                std::cout << "postprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+                
+                imgs.clear();
+                if(char(cv::waitKey(1))=='q')
+                    break;
+            }
+        }
+        
+        // Destroy the engine
+        context->destroy();
+        engine->destroy();
+        runtime->destroy();
+        return 0;
     } else {
         std::cerr << "arguments not right!" << std::endl;
         std::cerr << "./yolov4 -s  // serialize model to plan file" << std::endl;
-        std::cerr << "./yolov4 -d ../samples  // deserialize plan file and run inference" << std::endl;
+        std::cerr << "./yolov4 -d ../samples  // deserialize plan file and run inference on image files in dir" << std::endl;
+        std::cerr << "./yolov4 -d 0  // deserialize plan file and run inference for camera" << std::endl;
         return -1;
     }
 
-    std::vector<std::string> file_names;
-    if (read_files_in_dir(argv[2], file_names) < 0) {
-        std::cout << "read_files_in_dir failed." << std::endl;
-        return -1;
-    }
-
-    // prepare input data ---------------------------
-    static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    //for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
-    //    data[i] = 1.0;
-    static float prob[BATCH_SIZE * OUTPUT_SIZE];
-    IRuntime* runtime = createInferRuntime(gLogger);
-    assert(runtime != nullptr);
-    ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size);
-    assert(engine != nullptr);
-    IExecutionContext* context = engine->createExecutionContext();
-    assert(context != nullptr);
-    delete[] trtModelStream;
-
-    int fcount = 0;
-    for (int f = 0; f < (int)file_names.size(); f++) {
-        fcount++;
-        if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
-        for (int b = 0; b < fcount; b++) {
-            cv::Mat img = cv::imread(std::string(argv[2]) + "/" + file_names[f - fcount + 1 + b]);
-            if (img.empty()) continue;
-            cv::Mat pr_img = preprocess_img(img);
-            for (int i = 0; i < INPUT_H * INPUT_W; i++) {
-                data[b * 3 * INPUT_H * INPUT_W + i] = pr_img.at<cv::Vec3b>(i)[2] / 255.0;
-                data[b * 3 * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = pr_img.at<cv::Vec3b>(i)[1] / 255.0;
-                data[b * 3 * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = pr_img.at<cv::Vec3b>(i)[0] / 255.0;
-            }
-        }
-
-        // Run inference
-        auto start = std::chrono::system_clock::now();
-        doInference(*context, data, prob, BATCH_SIZE);
-        auto end = std::chrono::system_clock::now();
-        std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-        std::vector<std::vector<Yolo::Detection>> batch_res(fcount);
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-            nms(res, &prob[b * OUTPUT_SIZE]);
-        }
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-            //std::cout << res.size() << std::endl;
-            cv::Mat img = cv::imread(std::string(argv[2]) + "/" + file_names[f - fcount + 1 + b]);
-            for (size_t j = 0; j < res.size(); j++) {
-                //float *p = (float*)&res[j];
-                //for (size_t k = 0; k < 7; k++) {
-                //    std::cout << p[k] << ", ";
-                //}
-                //std::cout << std::endl;
-                cv::Rect r = get_rect(img, res[j].bbox);
-                cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
-                cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
-            }
-            cv::imwrite("_" + file_names[f - fcount + 1 + b], img);
-        }
-        fcount = 0;
-    }
-
-    // Destroy the engine
-    context->destroy();
-    engine->destroy();
-    runtime->destroy();
 
     //Print histogram of the output distribution
     //std::cout << "\nOutput:\n\n";
